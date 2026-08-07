@@ -102,6 +102,45 @@ function RegistryPage({
     }
   }, [records, storageKey])
 
+  useEffect(() => {
+    if (storageKey !== customerRegistryStorageKey) {
+      return
+    }
+
+    let cancelled = false
+    void fetch('/api/registry/customers')
+      .then(async (response) => {
+        if (!response.ok) {
+          return []
+        }
+        const payload = (await response.json()) as { records?: unknown }
+        return Array.isArray(payload.records)
+          ? payload.records.filter(isRegistryRecord)
+          : []
+      })
+      .then((backendRecords) => {
+        if (cancelled) {
+          return
+        }
+        setRecords((currentRecords) => [
+          ...backendRecords,
+          ...currentRecords.filter(
+            (currentRecord) =>
+              !backendRecords.some(
+                (backendRecord) => backendRecord.id === currentRecord.id,
+              ),
+          ),
+        ])
+      })
+      .catch(() => {
+        // Browser-local customer creation remains usable while the API is offline.
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [storageKey])
+
   function openCreateModal() {
     if (readOnly) {
       return
@@ -630,4 +669,18 @@ function readStoredRecords(storageKey: string) {
   } catch {
     return []
   }
+}
+
+function isRegistryRecord(value: unknown): value is RegistryRecord {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+
+  const record = value as RegistryRecord
+  return (
+    typeof record.id === 'string' &&
+    typeof record.name === 'string' &&
+    typeof record.siteId === 'string' &&
+    typeof record.mpan === 'string'
+  )
 }

@@ -87,6 +87,13 @@ export const pagePrivileges = [
     maintainPermission: 'Maintain Manage Role',
   },
   {
+    key: 'calendar-setup',
+    label: 'Calendar Setup',
+    path: '/system-setting/calendar-setup',
+    readPermission: 'Read Calendar Setup',
+    maintainPermission: 'Maintain Calendar Setup',
+  },
+  {
     key: 'audit-logs',
     label: 'Audit Logs',
     path: '/system-setting/audit-logs',

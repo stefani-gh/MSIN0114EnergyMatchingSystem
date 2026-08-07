@@ -569,7 +569,13 @@ function EmptyCellWarningModal({
             {getUploadTypeLabel(warning.uploadType)} file "{warning.file.name}"
             contains empty value in {formatCellList(warning.emptyCells)}.
           </p>
-          <p>Continue to proceed? Empty values will be pre-filled as 0.</p>
+          <p>
+            Continue to proceed? Missing half-hourly readings will be estimated
+            from the same period in the preceding four weeks. If all four
+            readings are not available, the previous week&apos;s actual reading
+            will be used. The file will be rejected if neither method can be
+            applied.
+          </p>
         </div>
 
         <div className="flex justify-end gap-2 border-t border-slate-200 px-5 py-4">

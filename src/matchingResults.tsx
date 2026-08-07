@@ -8,11 +8,18 @@ import {
 } from './matchingResultsContext'
 
 const matchingResultsStorageKey = 'energy-matching-results'
+const matchingServerInstanceStorageKey = 'energy-matching-server-instance'
 
 type StoredMatchingResults = {
   results: MatchingEngineResult[]
   selectedResultId: string | null
   databaseRecords: DatabaseRecord[]
+}
+
+type SeededMatchingResults = {
+  results: MatchingEngineResult[]
+  databaseRecords: DatabaseRecord[]
+  serverInstanceId: string
 }
 
 const emptyStoredMatchingResults: StoredMatchingResults = {
@@ -23,9 +30,7 @@ const emptyStoredMatchingResults: StoredMatchingResults = {
 
 function readStoredResults(): StoredMatchingResults {
   try {
-    const storedValue =
-      window.localStorage.getItem(matchingResultsStorageKey) ??
-      window.sessionStorage.getItem(matchingResultsStorageKey)
+    const storedValue = window.sessionStorage.getItem(matchingResultsStorageKey)
 
     if (!storedValue) {
       return emptyStoredMatchingResults
@@ -86,11 +91,11 @@ function persistResults(
   databaseRecords: DatabaseRecord[],
 ) {
   try {
-    window.localStorage.setItem(
+    window.sessionStorage.setItem(
       matchingResultsStorageKey,
       JSON.stringify({ results, selectedResultId, databaseRecords }),
     )
-    window.sessionStorage.removeItem(matchingResultsStorageKey)
+    window.localStorage.removeItem(matchingResultsStorageKey)
   } catch {
     // Large local histories may exceed browser storage. The in-memory history still works.
   }
@@ -119,6 +124,78 @@ export function MatchingResultsProvider({ children }: { children: ReactNode }) {
     persistResults(results, result?.id ?? null, databaseRecords)
   }, [databaseRecords, result?.id, results])
 
+  useEffect(() => {
+    let isCancelled = false
+
+    async function loadSeededResults() {
+      try {
+        const response = await fetch('/api/matching/test-results')
+
+        if (!response.ok) {
+          return
+        }
+
+        const payload = (await response.json()) as SeededMatchingResults
+
+        if (isCancelled || !Array.isArray(payload.results)) {
+          return
+        }
+
+        const previousServerInstanceId = window.sessionStorage.getItem(
+          matchingServerInstanceStorageKey,
+        )
+        const serverRestarted =
+          Boolean(previousServerInstanceId) &&
+          previousServerInstanceId !== payload.serverInstanceId
+        window.sessionStorage.setItem(
+          matchingServerInstanceStorageKey,
+          payload.serverInstanceId,
+        )
+
+        if (serverRestarted) {
+          setResults(payload.results)
+          setDatabaseRecords(
+            Array.isArray(payload.databaseRecords) ? payload.databaseRecords : [],
+          )
+          setSelectedResultId(payload.results[0]?.id ?? null)
+          return
+        }
+
+        setResults((currentResults) => [
+          ...payload.results,
+          ...currentResults.filter(
+            (currentResult) =>
+              !payload.results.some(
+                (seededResult) => seededResult.id === currentResult.id,
+              ),
+          ),
+        ])
+        setDatabaseRecords((currentRecords) => [
+          ...(Array.isArray(payload.databaseRecords)
+            ? payload.databaseRecords
+            : []),
+          ...currentRecords.filter(
+            (currentRecord) =>
+              !payload.databaseRecords?.some(
+                (seededRecord) => seededRecord.id === currentRecord.id,
+              ),
+          ),
+        ])
+        setSelectedResultId((currentId) =>
+          currentId ?? payload.results[0]?.id ?? null,
+        )
+      } catch {
+        // The app remains usable with browser-local results if the API is offline.
+      }
+    }
+
+    void loadSeededResults()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [])
+
   const setResult = useCallback(
     async (
       nextResult: MatchingEngineResult,
@@ -128,7 +205,6 @@ export function MatchingResultsProvider({ children }: { children: ReactNode }) {
       const serializedSourceFiles = sourceFiles
         ? await serializeMatchingSourceFiles(sourceFiles)
         : null
-
       setResults((currentResults) => [
         resultWithId,
         ...currentResults.filter(

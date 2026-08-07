@@ -58,9 +58,10 @@ production-ready services.
   interval.
 - The React app sends uploaded files to `/api/matching/run` and stores the
   returned result for the Results screens.
-- Supports non-carry-forward matching, hourly carry-forward matching within
-  each pair of half-hourly periods, and daily carry-forward matching that
-  resets at the end of every spreadsheet date.
+- Supports half-hourly matching, hourly aggregation across each pair of
+  half-hourly periods, and daily aggregation across all intervals on each
+  spreadsheet date. Aggregate modes net consumption and allocated generation
+  inside the selected period, irrespective of their order within that period.
 
 ## Admin Sub-Functions
 

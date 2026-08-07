@@ -8,15 +8,15 @@ export type MatchingApproach =
 export const matchingApproachOptions = [
   {
     value: 'carry-forward',
-    label: 'Carry forward (Daily)',
+    label: 'Aggregate (Daily)',
   },
   {
     value: 'carry-forward-hourly',
-    label: 'Carry forward (Hourly)',
+    label: 'Aggregate (Hourly)',
   },
   {
     value: 'non-carry-forward',
-    label: 'Non-carry forward approach',
+    label: 'Half-hourly matching',
   },
 ] as const satisfies ReadonlyArray<{
   value: MatchingApproach
@@ -28,8 +28,6 @@ export const generatorCommodityOptions = [
   'Solar power',
   'Hydropower',
   'Biomass energy',
-  'Wood pellets/ chips',
-  'Organic waste',
 ] as const
 
 export type GeneratorCommodity = (typeof generatorCommodityOptions)[number]

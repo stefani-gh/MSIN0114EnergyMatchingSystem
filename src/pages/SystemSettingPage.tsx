@@ -1,5 +1,12 @@
-import { Plus, UploadCloud, X } from 'lucide-react'
-import { useMemo, useState, type FormEvent } from 'react'
+import {
+  CalendarDays,
+  ChevronLeft,
+  ChevronRight,
+  Plus,
+  UploadCloud,
+  X,
+} from 'lucide-react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { Navigate, useParams } from 'react-router-dom'
 import { AuditLogsTable } from '../components/AdminTables'
 import {
@@ -40,6 +47,15 @@ import {
   setRolePermission,
 } from '../permissions'
 import { readCustomerAllocationsFromStorage } from '../registryStorage'
+import {
+  readSettlementCalendar,
+  loadAndMergeSettlementCalendar,
+  saveSettlementCalendar,
+  writeSettlementCalendar,
+  type CalendarDayType,
+  type CalendarStatus,
+  type SettlementCalendarEntry,
+} from '../calendarSettings'
 import { useMockSession } from '../session'
 import {
   useSystemSettings,
@@ -118,8 +134,275 @@ export function SystemSettingPage() {
     return <DatabasePage readOnly={readOnly} />
   }
 
+  if (subFunction === 'calendar-setup') {
+    return <CalendarSetupPage readOnly={readOnly} />
+  }
+
   return <Navigate to="/system-setting/manage-users" replace />
 }
+
+function CalendarSetupPage({ readOnly = false }: { readOnly?: boolean }) {
+  const [entries, setEntries] = useState<SettlementCalendarEntry[]>(
+    readSettlementCalendar,
+  )
+  const [date, setDate] = useState('')
+  const [dayType, setDayType] = useState<CalendarDayType>('46-period')
+  const [status, setStatus] = useState<CalendarStatus>('Active')
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    void loadAndMergeSettlementCalendar(entries)
+      .then((mergedEntries) => {
+        if (!cancelled) setEntries(mergedEntries)
+      })
+      .catch(() => {
+        if (!cancelled) setError('Calendar settings could not be loaded from the database.')
+      })
+    return () => { cancelled = true }
+    // Existing browser entries are intentionally migrated only once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  function saveEntries(nextEntries: SettlementCalendarEntry[]) {
+    setEntries(nextEntries)
+    writeSettlementCalendar(nextEntries)
+    void saveSettlementCalendar(nextEntries).catch(() => {
+      setError('Calendar settings could not be saved to the database.')
+    })
+  }
+
+  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const normalizedDate = normalizeCalendarDate(date)
+
+    if (!normalizedDate) {
+      setError('Enter a valid date in dd/mm/yy format.')
+      return
+    }
+
+    if (entries.some((entry) => entry.date === normalizedDate)) {
+      setError('A calendar entry already exists for this date.')
+      return
+    }
+
+    saveEntries([
+      ...entries,
+      {
+        id: `calendar-${Date.now()}`,
+        date: normalizedDate,
+        dayType,
+        status,
+      },
+    ])
+    setDate('')
+    setError('')
+  }
+
+  return (
+    <PageContainer
+      title="Calendar Setup"
+      description="Configure active UK short and long settlement days used during file validation."
+    >
+      <form
+        className="mb-6 grid gap-4 rounded-lg border border-slate-200 bg-white p-5 shadow-sm md:grid-cols-4 md:items-end"
+        onSubmit={handleSubmit}
+      >
+        <CalendarDateInput
+          value={date}
+          error={error}
+          disabled={readOnly}
+          onChange={(value) => {
+            setDate(value)
+            setError('')
+          }}
+        />
+        <SelectInput
+          label="Day type"
+          value={dayType}
+          disabled={readOnly}
+          onChange={(event) => setDayType(event.target.value as CalendarDayType)}
+        >
+          <option value="46-period">Short day (46 periods)</option>
+          <option value="50-period">Long day (50 periods)</option>
+        </SelectInput>
+        <SelectInput
+          label="Status"
+          value={status}
+          disabled={readOnly}
+          onChange={(event) => setStatus(event.target.value as CalendarStatus)}
+        >
+          <option value="Active">Active</option>
+          <option value="Inactive">Inactive</option>
+        </SelectInput>
+        <Button type="submit" icon={Plus} disabled={readOnly}>Add</Button>
+      </form>
+
+      <div className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+        {entries.length ? (
+          <DataTable
+            columns={['Date', 'Day type', 'Status', 'Actions']}
+            rows={[...entries]
+              .sort((a, b) => getCalendarDateSortValue(b.date) - getCalendarDateSortValue(a.date))
+              .map((entry) => [
+                entry.date,
+                entry.dayType === '46-period' ? 'Short day (46 periods)' : 'Long day (50 periods)',
+                <StatusBadge tone={entry.status === 'Active' ? 'green' : 'slate'}>
+                  {entry.status}
+                </StatusBadge>,
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={readOnly}
+                  onClick={() => saveEntries(entries.filter((item) => item.id !== entry.id))}
+                >Delete</Button>,
+              ])}
+          />
+        ) : (
+          <PlaceholderNotice>No calendar entries are configured.</PlaceholderNotice>
+        )}
+      </div>
+    </PageContainer>
+  )
+}
+
+function formatCalendarDateInput(value: string) {
+  const digits = value.replace(/\D/g, '').slice(0, 6)
+  return [digits.slice(0, 2), digits.slice(2, 4), digits.slice(4, 6)]
+    .filter(Boolean)
+    .join('/')
+}
+
+function CalendarDateInput({
+  value,
+  error,
+  disabled,
+  onChange,
+}: {
+  value: string
+  error: string
+  disabled: boolean
+  onChange: (value: string) => void
+}) {
+  const initialDate = getCalendarPickerDate(value) ?? new Date()
+  const [isOpen, setIsOpen] = useState(false)
+  const [displayYear, setDisplayYear] = useState(initialDate.getFullYear())
+  const [displayMonth, setDisplayMonth] = useState(initialDate.getMonth())
+  const monthNames = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ]
+  const firstWeekday = new Date(displayYear, displayMonth, 1).getDay()
+  const daysInMonth = new Date(displayYear, displayMonth + 1, 0).getDate()
+  const selectedDate = getCalendarPickerDate(value)
+
+  function changeMonth(offset: number) {
+    const nextDate = new Date(displayYear, displayMonth + offset, 1)
+    setDisplayYear(nextDate.getFullYear())
+    setDisplayMonth(nextDate.getMonth())
+  }
+
+  function selectDay(day: number) {
+    onChange(
+      `${String(day).padStart(2, '0')}/${String(displayMonth + 1).padStart(2, '0')}/${String(displayYear).slice(-2)}`,
+    )
+    setIsOpen(false)
+  }
+
+  return (
+    <div className="relative">
+      <label className="mb-1.5 block text-sm font-medium text-slate-700" htmlFor="calendar-date">
+        Date
+      </label>
+      <div className="relative">
+        <input
+          id="calendar-date"
+          value={value}
+          placeholder="dd/mm/yy"
+          inputMode="numeric"
+          disabled={disabled}
+          className={`w-full rounded-md border bg-white px-3 py-2 pr-10 text-sm outline-none transition focus:ring-2 ${
+            error
+              ? 'border-rose-400 focus:border-rose-500 focus:ring-rose-100'
+              : 'border-slate-300 focus:border-[#3A61F4] focus:ring-[#3A61F4]/15'
+          } disabled:bg-slate-100`}
+          onChange={(event) => onChange(formatCalendarDateInput(event.target.value))}
+        />
+        <button
+          type="button"
+          aria-label="Open calendar"
+          disabled={disabled}
+          className="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-slate-500 hover:text-[#3A61F4] disabled:text-slate-300"
+          onClick={() => setIsOpen((current) => !current)}
+        >
+          <CalendarDays size={18} />
+        </button>
+      </div>
+      {error && <p className="mt-1 text-xs text-rose-600">{error}</p>}
+
+      {isOpen && !disabled && (
+        <div className="absolute left-0 top-full z-30 mt-2 w-[320px] rounded-lg border border-slate-200 bg-white p-4 shadow-xl">
+          <div className="mb-4 flex items-center gap-2">
+            <button type="button" aria-label="Previous month" className="rounded-md border border-slate-200 p-2 hover:bg-slate-50" onClick={() => changeMonth(-1)}>
+              <ChevronLeft size={18} />
+            </button>
+            <select className="flex-1 rounded-md border border-slate-300 px-2 py-2 text-sm font-medium" value={displayMonth} onChange={(event) => setDisplayMonth(Number(event.target.value))}>
+              {monthNames.map((month, index) => <option key={month} value={index}>{month}</option>)}
+            </select>
+            <select className="w-24 rounded-md border border-slate-300 px-2 py-2 text-sm font-medium" value={displayYear} onChange={(event) => setDisplayYear(Number(event.target.value))}>
+              {Array.from({ length: 21 }, (_, index) => new Date().getFullYear() - 10 + index).map((year) => <option key={year} value={year}>{year}</option>)}
+            </select>
+            <button type="button" aria-label="Next month" className="rounded-md border border-slate-200 p-2 hover:bg-slate-50" onClick={() => changeMonth(1)}>
+              <ChevronRight size={18} />
+            </button>
+          </div>
+          <div className="grid grid-cols-7 gap-1 text-center text-xs font-medium text-slate-500">
+            {['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'].map((day) => <div key={day} className="py-1">{day}</div>)}
+          </div>
+          <div className="mt-1 grid grid-cols-7 gap-1">
+            {Array.from({ length: firstWeekday }, (_, index) => <div key={`blank-${index}`} />)}
+            {Array.from({ length: daysInMonth }, (_, index) => index + 1).map((day) => {
+              const isSelected = selectedDate?.getFullYear() === displayYear && selectedDate.getMonth() === displayMonth && selectedDate.getDate() === day
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  className={`h-9 rounded-full text-sm transition ${isSelected ? 'bg-[#3A61F4] font-semibold text-white' : 'text-slate-700 hover:bg-[#3A61F4]/10'}`}
+                  onClick={() => selectDay(day)}
+                >{day}</button>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function getCalendarPickerDate(value: string) {
+  const match = value.match(/^(\d{2})\/(\d{2})\/(\d{2})$/)
+  if (!match) return null
+  const date = new Date(Number(`20${match[3]}`), Number(match[2]) - 1, Number(match[1]))
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+function normalizeCalendarDate(value: string) {
+  const match = value.match(/^(\d{2})\/(\d{2})\/(\d{2})$/)
+  if (!match) return ''
+  const day = Number(match[1]); const month = Number(match[2]); const year = 2000 + Number(match[3])
+  const parsed = new Date(Date.UTC(year, month - 1, day))
+  return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day
+    ? `${match[1]}/${match[2]}/${year}`
+    : ''
+}
+
+function getCalendarDateSortValue(value: string) {
+  const match = value.match(/^(\d{2})\/(\d{2})\/(\d{4})$/)
+  return match
+    ? Date.UTC(Number(match[3]), Number(match[2]) - 1, Number(match[1]))
+    : 0
+}
+
 
 function ManageUsersPage({ readOnly = false }: { readOnly?: boolean }) {
   const {

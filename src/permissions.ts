@@ -75,6 +75,10 @@ export function getSystemSettingPageKey(subFunction: string | undefined) {
     return 'database'
   }
 
+  if (subFunction === 'calendar-setup') {
+    return 'calendar-setup'
+  }
+
   return null
 }
 

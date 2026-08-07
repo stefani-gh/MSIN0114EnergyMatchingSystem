@@ -1,6 +1,7 @@
 import {
   BarChart3,
   Building2,
+  CalendarDays,
   ChevronDown,
   ChevronRight,
   Database,
@@ -107,6 +108,12 @@ const navigation: NavItem[] = [
         path: '/system-setting/manage-role',
         pageKey: 'manage-role',
         icon: ShieldCheck,
+      },
+      {
+        label: 'Calendar Setup',
+        path: '/system-setting/calendar-setup',
+        pageKey: 'calendar-setup',
+        icon: CalendarDays,
       },
       {
         label: 'Audit Logs',

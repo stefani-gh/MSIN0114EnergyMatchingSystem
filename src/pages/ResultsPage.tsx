@@ -84,11 +84,6 @@ const chartColors = {
   ],
 }
 
-const chronologicalHalfHourlyIntervals = [...halfHourlyIntervals].sort(
-  (firstInterval, secondInterval) =>
-    getIntervalMinutes(firstInterval) - getIntervalMinutes(secondInterval),
-)
-
 const chartSeriesLabels: Record<string, string> = {
   consumptionKwh: 'Consumption',
   generationKwh: 'Generation',
@@ -545,8 +540,8 @@ function MatchingVisualisationSet({
 
       <div data-pdf-section>
         <SectionCard
-          title="Average Daily Profile"
-          description="Average half-hourly consumption and allocated generation shape across a typical day."
+          title="Average Matching-Period Profile"
+          description="Average consumption and allocated generation at the selected matching granularity."
         >
           <AverageDailyProfileChart
             results={results}
@@ -589,7 +584,7 @@ function MatchingVisualisationSet({
       <div data-pdf-section>
         <SectionCard
           title="Matching Score by Granularity"
-          description="Annual vs monthly vs 30-minute matching score."
+          description="Annual and monthly netting compared with the selected matching approach."
         >
           <MatchingScoreComparisonChart results={results} />
         </SectionCard>
@@ -597,8 +592,8 @@ function MatchingVisualisationSet({
 
       <div data-pdf-section>
         <SectionCard
-          title="Matching Score by Settlement Period"
-          description="Weighted matching score across each 30-minute settlement period."
+          title="Matching Score by Matching Period"
+          description="Weighted matching score across each period in the selected approach."
         >
           <MatchingScoreLineChart results={results} />
         </SectionCard>
@@ -607,7 +602,7 @@ function MatchingVisualisationSet({
       <div data-pdf-section data-pdf-heatmap-section="true">
         <SectionCard
           title="Matching Score Heatmap"
-          description="Daily matching score by 30-minute settlement period."
+          description="Daily matching score by period at the selected matching granularity."
         >
           <MatchingScoreHeatmap results={results} />
         </SectionCard>
@@ -735,6 +730,7 @@ function DailyEnergyLineChart({
             minTickGap={24}
           />
           <YAxis
+            domain={[0, 'auto']}
             tickLine={false}
             axisLine={{ stroke: '#CBD5E1' }}
             tickFormatter={(value) => formatNumber(Number(value))}
@@ -767,7 +763,7 @@ function DailyEnergyLineChart({
             }
           />
           <Line
-            type="natural"
+            type="linear"
             dataKey="consumptionKwh"
             name="Consumption"
             stroke={chartColors.consumption}
@@ -776,7 +772,7 @@ function DailyEnergyLineChart({
             activeDot={{ r: 5 }}
           />
           <Line
-            type="natural"
+            type="linear"
             dataKey="generationKwh"
             name={generationLabel}
             stroke={chartColors.generation}
@@ -787,7 +783,7 @@ function DailyEnergyLineChart({
           {commoditySeries.map((commoditySeriesItem) => (
             <Line
               key={commoditySeriesItem.dataKey}
-              type="natural"
+              type="linear"
               dataKey={commoditySeriesItem.dataKey}
               name={`${commoditySeriesItem.commodity} generation`}
               stroke={commoditySeriesItem.color}
@@ -841,7 +837,7 @@ function CommodityAverageProfileLineChart({
       data={profileData}
       series={series}
       xAxisInterval={3}
-      labelFormatter={(label) => `Settlement period: ${String(label)}`}
+      labelFormatter={(label) => `Matching period: ${String(label)}`}
     />
   )
 }
@@ -876,6 +872,7 @@ function CommodityEnergyLineChart({
           axisLine={{ stroke: '#CBD5E1' }}
         />
         <YAxis
+          domain={[0, 'auto']}
           tickLine={false}
           axisLine={{ stroke: '#CBD5E1' }}
           tickFormatter={(value) => formatNumber(Number(value))}
@@ -891,7 +888,7 @@ function CommodityEnergyLineChart({
         {series.map((commoditySeries) => (
           <Line
             key={commoditySeries.dataKey}
-            type="natural"
+            type="linear"
             dataKey={commoditySeries.dataKey}
             name={commoditySeries.commodity}
             stroke={commoditySeries.color}
@@ -1347,6 +1344,7 @@ function AverageDailyProfileChart({
           interval={3}
         />
         <YAxis
+          domain={[0, 'auto']}
           tickLine={false}
           axisLine={{ stroke: '#CBD5E1' }}
           tickFormatter={(value) => formatNumber(Number(value))}
@@ -1360,7 +1358,7 @@ function AverageDailyProfileChart({
         />
         <Legend />
         <Line
-          type="natural"
+          type="linear"
           dataKey="averageConsumptionKwh"
           name="Average consumption"
           stroke={chartColors.consumption}
@@ -1369,7 +1367,7 @@ function AverageDailyProfileChart({
           activeDot={{ r: 5 }}
         />
         <Line
-          type="natural"
+          type="linear"
           dataKey="averageGenerationKwh"
           name={generationLabel}
           stroke={chartColors.generation}
@@ -1571,10 +1569,10 @@ function MatchingScoreLineChart({
             `${formatPercentage(Number(value))}%`,
             'Matching score',
           ]}
-          labelFormatter={(label) => `Settlement period: ${String(label)}`}
+          labelFormatter={(label) => `Matching period: ${String(label)}`}
         />
         <Area
-          type="natural"
+          type="linear"
           dataKey="matchingScore"
           name="Matching score"
           stroke={chartColors.score}
@@ -1685,7 +1683,7 @@ function MatchingScoreHeatmap({
                 className="sticky bottom-0 z-10 flex h-7 items-center justify-center bg-white text-sm font-semibold text-slate-700"
                 style={{ gridColumn: `3 / span ${heatmapData.days.length}` }}
               >
-                Settlement Period
+                Matching Period
               </div>
             </div>
           </div>
@@ -1724,7 +1722,7 @@ function PdfMatchingScoreHeatmap({
             Monthly matching score summary
           </p>
           <p className="mt-1 text-xs font-medium text-slate-500">
-            Average by settlement period
+            Average by matching period
           </p>
         </div>
         <div
@@ -1735,7 +1733,7 @@ function PdfMatchingScoreHeatmap({
           }}
         >
           <div className="flex h-8 items-center justify-end border-b border-r border-slate-200 bg-slate-50 pr-2 text-[11px] font-semibold text-slate-700">
-            Settlement period
+            Matching period
           </div>
           {heatmapData.columns.map((column) => (
             <div
@@ -2065,7 +2063,7 @@ function getMatchingScoreGranularityData(results: HalfHourlyMatchingResult[]) {
       totalMatchedEnergyKwh: monthlyMatchedEnergyKwh,
     },
     {
-      granularity: '30-Minute',
+      granularity: getResultPeriodLabel(results),
       totalMatchedEnergyKwh: intervalMatchedEnergyKwh,
     },
   ]
@@ -2266,7 +2264,7 @@ function getNettedMatchedEnergy(consumptionKwh: number, generationKwh: number) {
 }
 
 function getSettlementIntervalsInUse(results: HalfHourlyMatchingResult[]) {
-  const intervalLabels = new Set(chronologicalHalfHourlyIntervals)
+  const intervalLabels = new Set<string>()
 
   results.forEach((row) => {
     if (row.interval.trim()) {
@@ -2278,6 +2276,21 @@ function getSettlementIntervalsInUse(results: HalfHourlyMatchingResult[]) {
     (firstInterval, secondInterval) =>
       getIntervalMinutes(firstInterval) - getIntervalMinutes(secondInterval),
   )
+}
+
+function getResultPeriodLabel(results: HalfHourlyMatchingResult[]) {
+  if (results.some((row) => row.interval === 'Daily')) {
+    return 'Daily'
+  }
+
+  if (
+    results.length > 0 &&
+    results.every((row) => /^\d{2}:00$/.test(row.interval))
+  ) {
+    return 'Hourly'
+  }
+
+  return '30-Minute'
 }
 
 function getIntervalMinutes(interval: string) {
@@ -2977,7 +2990,7 @@ function addPdfHeatmapSection({
       pageContentWidth - padding * 2,
     )
     const descriptionLines = pdf.splitTextToSize(
-      'Daily matching score by 30-minute settlement period.',
+      'Daily matching score by period at the selected matching granularity.',
       pageContentWidth - padding * 2,
     )
     const titleHeight =
@@ -3088,7 +3101,7 @@ function addPdfHeatmapSection({
     pdf.setFontSize(6)
     pdf.setTextColor('#475569')
     pdf.text(
-      'Settlement Period',
+      'Matching Period',
       gridX + intervalColumnWidth + (gridWidth - intervalColumnWidth) / 2,
       gridY + gridHeight + 28,
       { align: 'center' },

@@ -1,3 +1,13 @@
+"""Validation and half-hourly energy matching for uploaded meter data.
+
+The public entry point is :func:`run_matching_engine`. It parses consumption
+and generation templates, aligns records by date, applies each customer's
+generation share, and returns interval-level results plus summary totals.
+
+Energy values are expressed in kWh. A spreadsheet row represents one meter on
+one date and contains 48 half-hourly readings.
+"""
+
 from __future__ import annotations
 
 import csv
@@ -14,31 +24,32 @@ from xml.etree import ElementTree
 
 
 class MatchingModelError(ValueError):
+    """Raised when an uploaded file or matching option is invalid."""
+
     pass
 
 
 @dataclass
 class UploadedFile:
+    """A file received by the API before it has been parsed."""
+
     filename: str
     content: bytes
 
 
 @dataclass
 class ParsedEnergyRecord:
+    """One validated spreadsheet row containing a full day of readings."""
+
     record_number: int
     site_id: str
     mpan: str
     date: str
     intervals: list[float]
+    interval_labels: list[str] | None = None
 
 
-@dataclass
-class CarryForwardLot:
-    source_row: dict[str, Any]
-    remaining_kwh: float
-    commodity_remaining: dict[str, float]
-
-
+# Templates label an interval by its end time: 00:30 through 00:00.
 HALF_HOURLY_INTERVALS = [
     f"{(((index + 1) * 30) % (24 * 60)) // 60:02d}:{(((index + 1) * 30) % (24 * 60)) % 60:02d}"
     for index in range(48)
@@ -59,6 +70,8 @@ TEMPLATE_HEADERS = {
         "Daily Total",
     ],
 }
+CLOCK_CHANGE_HEADERS = ["Clock Change Period 1", "Clock Change Period 2"]
+LEGACY_RESERVED_HEADERS = ["Reserved 1", "Reserved 2"]
 FIRST_INTERVAL_COLUMN_INDEX = 3
 LAST_INTERVAL_COLUMN_INDEX = 50
 DATE_COLUMN_INDEX = 2
@@ -67,13 +80,21 @@ EXCEL_DATE_EPOCH = datetime(1899, 12, 30, tzinfo=timezone.utc)
 DAILY_TOTAL_TOLERANCE = 0.000001
 UNMAPPED_COMMODITY_LABEL = "Unmapped commodity"
 MATCHING_APPROACH_LABELS = {
-    "carry-forward": "Carry forward (Daily)",
-    "carry-forward-hourly": "Carry forward (Hourly)",
-    "non-carry-forward": "Non-carry forward approach",
+    # The carry-forward keys are retained for compatibility with saved frontend
+    # results and API clients; their current behavior is period aggregation.
+    "carry-forward": "Aggregate (Daily)",
+    "carry-forward-hourly": "Aggregate (Hourly)",
+    "non-carry-forward": "Half-hourly matching",
 }
 
 
-def validate_energy_file_template(file: UploadedFile, upload_type: str) -> list[str]:
+def validate_energy_file_template(
+    file: UploadedFile,
+    upload_type: str,
+    settlement_calendar_json: str = "[]",
+) -> list[str]:
+    """Validate an upload and return non-fatal references to empty cells."""
+
     _validate_upload_type(upload_type)
     _validate_file_extension(file.filename)
 
@@ -85,18 +106,28 @@ def validate_energy_file_template(file: UploadedFile, upload_type: str) -> list[
         ) from exc
 
     validate_template_headers(upload_type, rows[0] if rows else [])
-    validation_result = validate_energy_data_rows(upload_type, rows)
+    calendar = parse_settlement_calendar(settlement_calendar_json)
+    validation_result = validate_energy_data_rows(upload_type, rows, calendar)
 
     if validation_result["errors"]:
         raise MatchingModelError(
             format_file_validation_errors(upload_type, validation_result["errors"])
         )
 
+    parse_energy_records(rows, upload_type, calendar)
+
     return validation_result["empty_cells"]
 
 
-def get_generation_sources(file: UploadedFile) -> list[dict[str, str]]:
-    generation_records = parse_energy_file(file, "generation")
+def get_generation_sources(
+    file: UploadedFile,
+    settlement_calendar_json: str = "[]",
+) -> list[dict[str, str]]:
+    """Return each distinct generator MPAN for the allocation UI."""
+
+    generation_records = parse_energy_file(
+        file, "generation", settlement_calendar_json
+    )
     generation_sources: list[dict[str, str]] = []
     seen_mpan_keys = set()
 
@@ -123,16 +154,32 @@ def run_matching_engine(
     customer_allocations_json: str = "[]",
     generator_commodity_mappings_json: str = "[]",
     matching_approach: str = "non-carry-forward",
+    settlement_calendar_json: str = "[]",
 ) -> dict[str, Any]:
+    """Run validation, matching, and aggregation for a pair of energy files.
+
+    Consumer and generator counts do not need to be equal. Generator readings
+    are combined by date, while each consumer is evaluated separately using
+    its configured allocation percentage.
+    """
+
     normalized_matching_approach = normalize_matching_approach(matching_approach)
-    consumption_records = parse_energy_file(consumption_file, "consumption")
-    generation_records = parse_energy_file(generation_file, "generation")
+    # Parsing performs all structural and cell-level validation before any
+    # matching takes place.
+    consumption_records = parse_energy_file(
+        consumption_file, "consumption", settlement_calendar_json
+    )
+    generation_records = parse_energy_file(
+        generation_file, "generation", settlement_calendar_json
+    )
 
     if not consumption_records or not generation_records:
         raise MatchingModelError(
             "Both files must contain at least one data row below the template header."
         )
 
+    # Distinct MPAN counts are used for display only; they do not restrict which
+    # files can be matched.
     matching_type_label = get_matching_type_label(
         consumption_records,
         generation_records,
@@ -148,8 +195,10 @@ def run_matching_engine(
     generator_commodity_map = build_generator_commodity_map(
         parse_generator_commodity_mappings(generator_commodity_mappings_json)
     )
+    # Pairing aligns data by date. Aggregate modes retain separate consumer rows
+    # because each consumer has its own allocated share of generation.
     matching_record_pairs = (
-        build_carry_forward_matching_record_pairs(
+        build_aggregate_matching_record_pairs(
             consumption_records,
             generation_records,
         )
@@ -171,7 +220,7 @@ def run_matching_engine(
     commodity_matched_totals: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     if normalized_matching_approach == "carry-forward":
-        results = build_carry_forward_matching_results(
+        results = build_daily_aggregate_matching_results(
             matching_record_pairs,
             customer_allocation_map,
             generation_records_by_date,
@@ -179,7 +228,7 @@ def run_matching_engine(
             commodity_matched_totals,
         )
     elif normalized_matching_approach == "carry-forward-hourly":
-        results = build_hourly_carry_forward_matching_results(
+        results = build_hourly_aggregate_matching_results(
             matching_record_pairs,
             customer_allocation_map,
             generation_records_by_date,
@@ -187,7 +236,7 @@ def run_matching_engine(
             commodity_matched_totals,
         )
     else:
-        results = build_non_carry_forward_matching_results(
+        results = build_half_hourly_matching_results(
             matching_record_pairs,
             customer_allocation_map,
             generation_records_by_date,
@@ -212,22 +261,27 @@ def run_matching_engine(
             normalized_matching_approach
         ],
         "matchingWarnings": matching_warnings,
-        "commodityEnergyResults": build_commodity_energy_results(
-            commodity_generation_totals,
-            commodity_matched_totals,
+        "commodityEnergyResults": aggregate_commodity_energy_results(
+            build_commodity_energy_results(
+                commodity_generation_totals,
+                commodity_matched_totals,
+            ),
+            normalized_matching_approach,
         ),
         "results": results,
         "summary": summary,
     }
 
 
-def build_non_carry_forward_matching_results(
+def build_half_hourly_matching_results(
     matching_record_pairs: list[tuple[ParsedEnergyRecord, ParsedEnergyRecord]],
     customer_allocation_map: dict[str, dict[str, Any]],
     generation_records_by_date: dict[str, list[ParsedEnergyRecord]],
     generator_commodity_map: dict[str, str],
     commodity_matched_totals: dict[tuple[str, str, str], dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """Match consumption only against generation in the same half hour."""
+
     results: list[dict[str, Any]] = []
 
     for record_index, (consumption_record, generation_record) in enumerate(
@@ -240,7 +294,9 @@ def build_non_carry_forward_matching_results(
             )
         )
 
-        for interval_index, interval in enumerate(HALF_HOURLY_INTERVALS):
+        for interval_index, interval in enumerate(
+            consumption_record.interval_labels or HALF_HOURLY_INTERVALS
+        ):
             consumption_kwh = consumption_record.intervals[interval_index]
             generation_kwh = generation_record.intervals[interval_index]
             interval_match = calculate_consumer_interval_match(
@@ -280,105 +336,54 @@ def build_non_carry_forward_matching_results(
     return results
 
 
-def build_carry_forward_matching_results(
+def build_daily_aggregate_matching_results(
     matching_record_pairs: list[tuple[ParsedEnergyRecord, ParsedEnergyRecord]],
     customer_allocation_map: dict[str, dict[str, Any]],
     generation_records_by_date: dict[str, list[ParsedEnergyRecord]],
     generator_commodity_map: dict[str, str],
     commodity_matched_totals: dict[tuple[str, str, str], dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
-    carry_pools: dict[str, list[CarryForwardLot]] = {}
-    active_date: str | None = None
+    """Net each consumer's consumption and allocated generation by day."""
 
-    for record_index, (consumption_record, generation_record) in enumerate(
-        matching_record_pairs
-    ):
-        if active_date is not None and consumption_record.date != active_date:
-            assign_carry_forward_excess_generation(carry_pools)
-            carry_pools = {}
-
-        active_date = consumption_record.date
-        customer_allocation, share_percentage, allocation_source = (
-            get_customer_allocation_context(
-                consumption_record,
-                customer_allocation_map,
-            )
-        )
-        carry_key = get_energy_record_lookup_key(
-            consumption_record.site_id,
-            consumption_record.mpan,
-        )
-        carry_pool = carry_pools.setdefault(carry_key, [])
-
-        for interval_index, interval in enumerate(HALF_HOURLY_INTERVALS):
-            consumption_kwh = consumption_record.intervals[interval_index]
-            generation_kwh = generation_record.intervals[interval_index]
-            allocated_generation_kwh = generation_kwh * (share_percentage / 100)
-            row = create_matching_result_row(
-                record_index,
-                interval,
-                consumption_record,
-                generation_record,
-                consumption_kwh,
-                generation_kwh,
-                allocated_generation_kwh,
-                0.0,
-                consumption_kwh,
-                0.0,
-                share_percentage,
-                allocation_source,
-                customer_allocation,
-            )
-
-            if allocated_generation_kwh > 0:
-                carry_pool.append(
-                    CarryForwardLot(
-                        source_row=row,
-                        remaining_kwh=allocated_generation_kwh,
-                        commodity_remaining=get_allocated_generation_by_commodity(
-                            generation_records_by_date.get(
-                                generation_record.date,
-                                [],
-                            ),
-                            interval_index,
-                            allocated_generation_kwh,
-                            generator_commodity_map,
-                        ),
-                    )
-                )
-
-            matched_energy_kwh = consume_carry_forward_generation(
-                carry_pool,
-                consumption_kwh,
-                row["date"],
-                interval,
-                commodity_matched_totals,
-                bool(generator_commodity_map),
-            )
-            row["matchedEnergyKwh"] = matched_energy_kwh
-            row["unmatchedConsumptionKwh"] = max(
-                consumption_kwh - matched_energy_kwh,
-                0.0,
-            )
-            row["consumptionMatchingPercentage"] = calculate_matching_percentage(
-                consumption_kwh,
-                matched_energy_kwh,
-            )
-            results.append(row)
-
-    assign_carry_forward_excess_generation(carry_pools)
-
-    return results
+    return build_aggregate_matching_results(
+        matching_record_pairs,
+        customer_allocation_map,
+        generation_records_by_date,
+        generator_commodity_map,
+        commodity_matched_totals,
+        intervals_per_window=0,
+    )
 
 
-def build_hourly_carry_forward_matching_results(
+def build_hourly_aggregate_matching_results(
     matching_record_pairs: list[tuple[ParsedEnergyRecord, ParsedEnergyRecord]],
     customer_allocation_map: dict[str, dict[str, Any]],
     generation_records_by_date: dict[str, list[ParsedEnergyRecord]],
     generator_commodity_map: dict[str, str],
     commodity_matched_totals: dict[tuple[str, str, str], dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """Net consumption and allocated generation within each clock hour."""
+
+    return build_aggregate_matching_results(
+        matching_record_pairs,
+        customer_allocation_map,
+        generation_records_by_date,
+        generator_commodity_map,
+        commodity_matched_totals,
+        intervals_per_window=2,
+    )
+
+
+def build_aggregate_matching_results(
+    matching_record_pairs: list[tuple[ParsedEnergyRecord, ParsedEnergyRecord]],
+    customer_allocation_map: dict[str, dict[str, Any]],
+    generation_records_by_date: dict[str, list[ParsedEnergyRecord]],
+    generator_commodity_map: dict[str, str],
+    commodity_matched_totals: dict[tuple[str, str, str], dict[str, Any]],
+    intervals_per_window: int,
+) -> list[dict[str, Any]]:
+    """Net energy inside fixed windows and return one row per matching window."""
+
     results: list[dict[str, Any]] = []
 
     for record_index, (consumption_record, generation_record) in enumerate(
@@ -390,77 +395,92 @@ def build_hourly_carry_forward_matching_results(
                 customer_allocation_map,
             )
         )
-        carry_pool: list[CarryForwardLot] = []
 
-        for interval_index, interval in enumerate(HALF_HOURLY_INTERVALS):
-            consumption_kwh = consumption_record.intervals[interval_index]
-            generation_kwh = generation_record.intervals[interval_index]
-            allocated_generation_kwh = generation_kwh * (share_percentage / 100)
-            row = create_matching_result_row(
-                record_index,
-                interval,
+        record_interval_count = len(consumption_record.intervals)
+        window_size = intervals_per_window or record_interval_count
+        for window_start in range(0, record_interval_count, window_size):
+            window_end = min(window_start + window_size, record_interval_count)
+            interval_indices = range(window_start, window_end)
+            total_consumption_kwh = sum(
+                consumption_record.intervals[index] for index in interval_indices
+            )
+            total_allocated_generation_kwh = sum(
+                generation_record.intervals[index] * (share_percentage / 100)
+                for index in interval_indices
+            )
+            total_matched_kwh = min(
+                total_consumption_kwh,
+                total_allocated_generation_kwh,
+            )
+            total_excess_kwh = max(
+                total_allocated_generation_kwh - total_consumption_kwh,
+                0.0,
+            )
+
+            total_generation_kwh = sum(
+                generation_record.intervals[index] for index in interval_indices
+            )
+            interval = get_aggregate_interval_label(
                 consumption_record,
-                generation_record,
-                consumption_kwh,
-                generation_kwh,
-                allocated_generation_kwh,
-                0.0,
-                consumption_kwh,
-                0.0,
-                share_percentage,
-                allocation_source,
-                customer_allocation,
+                window_end,
+                intervals_per_window,
+            )
+            results.append(
+                create_matching_result_row(
+                    record_index,
+                    interval,
+                    consumption_record,
+                    generation_record,
+                    total_consumption_kwh,
+                    total_generation_kwh,
+                    total_allocated_generation_kwh,
+                    total_matched_kwh,
+                    max(total_consumption_kwh - total_matched_kwh, 0.0),
+                    total_excess_kwh,
+                    share_percentage,
+                    allocation_source,
+                    customer_allocation,
+                )
             )
 
-            if allocated_generation_kwh > 0:
-                carry_pool.append(
-                    CarryForwardLot(
-                        source_row=row,
-                        remaining_kwh=allocated_generation_kwh,
-                        commodity_remaining=get_allocated_generation_by_commodity(
-                            generation_records_by_date.get(
-                                generation_record.date,
-                                [],
-                            ),
-                            interval_index,
-                            allocated_generation_kwh,
-                            generator_commodity_map,
-                        ),
+            if generator_commodity_map and total_allocated_generation_kwh > 0:
+                for interval_index in interval_indices:
+                    allocated_generation_kwh = (
+                        generation_record.intervals[interval_index]
+                        * (share_percentage / 100)
                     )
-                )
-
-            matched_energy_kwh = consume_carry_forward_generation(
-                carry_pool,
-                consumption_kwh,
-                row["date"],
-                interval,
-                commodity_matched_totals,
-                bool(generator_commodity_map),
-            )
-            row["matchedEnergyKwh"] = matched_energy_kwh
-            row["unmatchedConsumptionKwh"] = max(
-                consumption_kwh - matched_energy_kwh,
-                0.0,
-            )
-            row["consumptionMatchingPercentage"] = calculate_matching_percentage(
-                consumption_kwh,
-                matched_energy_kwh,
-            )
-            results.append(row)
-
-            if interval_index % 2 == 1:
-                assign_carry_forward_excess_generation(
-                    {"hourly-carry-pool": carry_pool}
-                )
-                carry_pool = []
+                    matched_source_kwh = total_matched_kwh * (
+                        allocated_generation_kwh / total_allocated_generation_kwh
+                    )
+                    add_commodity_matched_energy(
+                        commodity_matched_totals,
+                        generation_records_by_date.get(generation_record.date, []),
+                        interval_index,
+                        (generation_record.interval_labels or HALF_HOURLY_INTERVALS)[interval_index],
+                        matched_source_kwh,
+                        generator_commodity_map,
+                    )
 
     return results
+
+
+def get_aggregate_interval_label(
+    record: ParsedEnergyRecord,
+    window_end: int,
+    intervals_per_window: int,
+) -> str:
+    if intervals_per_window == 0:
+        return "Daily"
+
+    return (record.interval_labels or HALF_HOURLY_INTERVALS)[window_end - 1]
 
 
 def get_customer_allocation_context(
     consumption_record: ParsedEnergyRecord,
     customer_allocation_map: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, float, str]:
+    """Resolve a consumer's share, defaulting to 100% when unregistered."""
+
     customer_allocation = customer_allocation_map.get(
         get_energy_record_lookup_key(consumption_record.site_id, consumption_record.mpan)
     )
@@ -521,6 +541,8 @@ def calculate_matching_percentage(
     consumption_kwh: float,
     matched_energy_kwh: float,
 ) -> float:
+    """Return the percentage of consumption covered, capped at 100%."""
+
     return (
         0.0
         if consumption_kwh == 0
@@ -528,123 +550,9 @@ def calculate_matching_percentage(
     )
 
 
-def get_allocated_generation_by_commodity(
-    source_generation_records: list[ParsedEnergyRecord],
-    interval_index: int,
-    allocated_generation_kwh: float,
-    generator_commodity_map: dict[str, str],
-) -> dict[str, float]:
-    if not generator_commodity_map or allocated_generation_kwh <= 0:
-        return {}
-
-    total_generation_kwh = sum(
-        record.intervals[interval_index] for record in source_generation_records
-    )
-
-    if total_generation_kwh <= 0:
-        return {}
-
-    commodity_allocations: dict[str, float] = {}
-
-    for generation_record in source_generation_records:
-        source_generation_kwh = generation_record.intervals[interval_index]
-
-        if source_generation_kwh == 0:
-            continue
-
-        commodity = get_generator_commodity(
-            generation_record,
-            generator_commodity_map,
-        )
-        commodity_allocations[commodity] = commodity_allocations.get(
-            commodity,
-            0.0,
-        ) + allocated_generation_kwh * (source_generation_kwh / total_generation_kwh)
-
-    return commodity_allocations
-
-
-def consume_carry_forward_generation(
-    carry_pool: list[CarryForwardLot],
-    consumption_kwh: float,
-    consumption_date: str,
-    interval: str,
-    commodity_matched_totals: dict[tuple[str, str, str], dict[str, Any]],
-    track_commodities: bool,
-) -> float:
-    remaining_consumption_kwh = consumption_kwh
-    matched_energy_kwh = 0.0
-
-    while remaining_consumption_kwh > 0 and carry_pool:
-        lot = carry_pool[0]
-        consumed_kwh = min(remaining_consumption_kwh, lot.remaining_kwh)
-
-        if consumed_kwh <= 0:
-            carry_pool.pop(0)
-            continue
-
-        consume_commodity_generation(
-            lot,
-            consumed_kwh,
-            consumption_date,
-            interval,
-            commodity_matched_totals,
-            track_commodities,
-        )
-        lot.remaining_kwh -= consumed_kwh
-        matched_energy_kwh += consumed_kwh
-        remaining_consumption_kwh -= consumed_kwh
-
-        if lot.remaining_kwh <= DAILY_TOTAL_TOLERANCE:
-            carry_pool.pop(0)
-
-    return matched_energy_kwh
-
-
-def consume_commodity_generation(
-    lot: CarryForwardLot,
-    consumed_kwh: float,
-    consumption_date: str,
-    interval: str,
-    commodity_matched_totals: dict[tuple[str, str, str], dict[str, Any]],
-    track_commodities: bool,
-) -> None:
-    if not track_commodities or not lot.commodity_remaining or lot.remaining_kwh <= 0:
-        return
-
-    consumed_ratio = consumed_kwh / lot.remaining_kwh
-
-    for commodity, commodity_kwh in list(lot.commodity_remaining.items()):
-        consumed_commodity_kwh = commodity_kwh * consumed_ratio
-
-        if consumed_commodity_kwh <= 0:
-            continue
-
-        current_total = get_or_create_commodity_energy_total(
-            commodity_matched_totals,
-            commodity,
-            consumption_date,
-            interval,
-        )
-        current_total["matchedEnergyKwh"] += consumed_commodity_kwh
-        lot.commodity_remaining[commodity] = max(
-            commodity_kwh - consumed_commodity_kwh,
-            0.0,
-        )
-
-
-def assign_carry_forward_excess_generation(
-    carry_pools: dict[str, list[CarryForwardLot]],
-) -> None:
-    for carry_pool in carry_pools.values():
-        for lot in carry_pool:
-            if lot.remaining_kwh <= DAILY_TOTAL_TOLERANCE:
-                continue
-
-            lot.source_row["excessGenerationKwh"] += lot.remaining_kwh
-
-
 def build_matching_summary(results: list[dict[str, Any]]) -> dict[str, float]:
+    """Aggregate interval rows into totals for the result dashboard."""
+
     summary = {
         "totalConsumptionKwh": 0.0,
         "totalGenerationKwh": 0.0,
@@ -699,6 +607,8 @@ def get_matching_type_label(
     consumption_records: list[ParsedEnergyRecord],
     generation_records: list[ParsedEnergyRecord],
 ) -> str:
+    """Describe the run using counts of distinct consumer/generator MPANs."""
+
     has_multiple_consumers = count_distinct_mpans(consumption_records) > 1
     has_multiple_generators = count_distinct_mpans(generation_records) > 1
 
@@ -721,7 +631,11 @@ def count_distinct_mpans(records: list[ParsedEnergyRecord]) -> int:
 def calculate_consumer_interval_match(
     *, consumption_kwh: float, total_generation_kwh: float, share_percentage: float
 ) -> dict[str, float]:
+    """Calculate the half-hourly result for one consumer and interval."""
+
+    # A consumer can use only its contracted share of total generation.
     allocated_generation_kwh = total_generation_kwh * (share_percentage / 100)
+    # Matching is bounded by both demand and the allocated supply.
     matched_energy_kwh = min(consumption_kwh, allocated_generation_kwh)
     unmatched_consumption_kwh = max(consumption_kwh - allocated_generation_kwh, 0)
     excess_allocated_generation_kwh = max(
@@ -742,18 +656,35 @@ def calculate_consumer_interval_match(
     }
 
 
-def parse_energy_file(file: UploadedFile, upload_type: str) -> list[ParsedEnergyRecord]:
+def parse_energy_file(
+    file: UploadedFile,
+    upload_type: str,
+    settlement_calendar_json: str = "[]",
+) -> list[ParsedEnergyRecord]:
+    """Validate a CSV/XLSX template and convert its data rows to records."""
+
     _validate_upload_type(upload_type)
     _validate_file_extension(file.filename)
 
     rows = read_spreadsheet_rows(file)
     validate_template_headers(upload_type, rows[0] if rows else [])
-    validation_result = validate_energy_data_rows(upload_type, rows)
+    calendar = parse_settlement_calendar(settlement_calendar_json)
+    validation_result = validate_energy_data_rows(upload_type, rows, calendar)
 
     if validation_result["errors"]:
         raise MatchingModelError(
             format_file_validation_errors(upload_type, validation_result["errors"])
         )
+
+    return parse_energy_records(rows, upload_type, calendar)
+
+
+def parse_energy_records(
+    rows: list[list[str]],
+    upload_type: str,
+    calendar: dict[str, str],
+) -> list[ParsedEnergyRecord]:
+    """Parse validated rows and impute missing half-hourly readings."""
 
     daily_total_column_index = get_daily_total_column_index(rows[0] if rows else [])
 
@@ -764,9 +695,12 @@ def parse_energy_file(file: UploadedFile, upload_type: str) -> list[ParsedEnergy
             row_index,
             upload_type,
             daily_total_column_index,
+            calendar,
         )
         if record is not None:
             records.append(record)
+
+    impute_missing_energy_values(records, upload_type)
 
     return records
 
@@ -776,7 +710,10 @@ def parse_energy_record(
     record_number: int,
     upload_type: str,
     daily_total_column_index: int | None,
+    calendar: dict[str, str],
 ) -> ParsedEnergyRecord | None:
+    """Parse one spreadsheet row; return ``None`` for a completely blank row."""
+
     has_data = any(cell.strip() for cell in row)
 
     if not has_data:
@@ -790,15 +727,46 @@ def parse_energy_record(
         )
 
     interval_cells = row[FIRST_INTERVAL_COLUMN_INDEX : LAST_INTERVAL_COLUMN_INDEX + 1]
-    intervals = [
-        parse_energy_value(
+    standard_intervals = [
+        parse_optional_energy_value(
             interval_cells[index] if index < len(interval_cells) else "",
             record_number,
             FIRST_INTERVAL_COLUMN_INDEX + index + 1,
         )
         for index in range(len(HALF_HOURLY_INTERVALS))
     ]
-    if daily_total_column_index is not None:
+    day_type = calendar.get(date)
+    profile_type = get_clock_change_profile_type(
+        row,
+        daily_total_column_index,
+        day_type,
+    )
+    interval_labels = list(HALF_HOURLY_INTERVALS)
+    intervals = standard_intervals
+
+    if profile_type == "46-period":
+        # The periods ending 01:30 and 02:00 do not exist on a UK short day.
+        intervals = standard_intervals[:2] + standard_intervals[4:]
+        interval_labels = interval_labels[:2] + interval_labels[4:]
+    elif profile_type in {"50-period", "50-period-impute"}:
+        reserve_start = (daily_total_column_index or 53) - 2
+        reserve_values = [
+            parse_optional_energy_value(
+                cell_at(row, reserve_start + index),
+                record_number,
+                reserve_start + index + 1,
+            )
+            for index in range(2)
+        ]
+        intervals = standard_intervals[:4] + reserve_values + standard_intervals[4:]
+        interval_labels = (
+            interval_labels[:4]
+            + ["01:30 GMT", "02:00 GMT"]
+            + interval_labels[4:]
+        )
+    if daily_total_column_index is not None and all(
+        math.isfinite(value) for value in intervals
+    ):
         daily_total_kwh = parse_energy_value(
             cell_at(row, daily_total_column_index),
             record_number,
@@ -818,10 +786,13 @@ def parse_energy_record(
         mpan=cell_at(row, 1).strip() or "0",
         date=date,
         intervals=intervals,
+        interval_labels=interval_labels,
     )
 
 
 def parse_energy_value(value: str, record_number: int, column_number: int) -> float:
+    """Parse a non-negative kWh value, treating an empty validation cell as zero."""
+
     trimmed_value = value.strip()
 
     if not trimmed_value:
@@ -842,7 +813,175 @@ def parse_energy_value(value: str, record_number: int, column_number: int) -> fl
     return numeric_value
 
 
+def parse_optional_energy_value(
+    value: str,
+    record_number: int,
+    column_number: int,
+) -> float:
+    """Parse an interval value while preserving an empty cell as missing."""
+
+    if not value.strip():
+        return math.nan
+
+    return parse_energy_value(value, record_number, column_number)
+
+
+def get_clock_change_profile_type(
+    row: list[str],
+    daily_total_column_index: int | None,
+    configured_day_type: str | None,
+) -> str:
+    """Resolve the actual 46/48/50-period shape allowed by the calendar rule."""
+
+    standard_values = [
+        cell_at(row, index).strip()
+        for index in range(
+            FIRST_INTERVAL_COLUMN_INDEX,
+            LAST_INTERVAL_COLUMN_INDEX + 1,
+        )
+    ]
+    has_clock_change_columns = daily_total_column_index == 53
+    clock_change_values = (
+        [cell_at(row, 51).strip(), cell_at(row, 52).strip()]
+        if has_clock_change_columns
+        else ["", ""]
+    )
+    populated_periods = sum(bool(value) for value in standard_values) + sum(
+        bool(value) for value in clock_change_values
+    )
+    has_short_day_gap = not standard_values[2] and not standard_values[3]
+
+    if configured_day_type == "46-period":
+        if populated_periods == 46 and has_short_day_gap:
+            return "46-period"
+        return "48-period"
+
+    if configured_day_type == "50-period":
+        if populated_periods == 50:
+            return "50-period"
+        if populated_periods == 46:
+            return "50-period-impute"
+        return "48-period"
+
+    return "48-period"
+
+
+def impute_missing_energy_values(
+    records: list[ParsedEnergyRecord],
+    upload_type: str,
+) -> None:
+    """Fill missing readings using a four-week average or previous-week fallback.
+
+    The primary estimate uses actual readings from the same half-hour 7, 14,
+    21 and 28 days earlier. All four must be available. Otherwise, the actual
+    reading from seven days earlier is used. Imputed readings are never reused
+    as historical inputs. Values that satisfy neither rule are fatal.
+    """
+
+    original_intervals = {
+        (
+            get_energy_record_lookup_key(record.site_id, record.mpan),
+            get_energy_date_ordinal(record.date),
+            label,
+        ): value
+        for record in records
+        for label, value in zip(
+            record.interval_labels or HALF_HOURLY_INTERVALS,
+            record.intervals,
+        )
+    }
+    unresolved_cells: list[str] = []
+
+    for record in records:
+        record_key = get_energy_record_lookup_key(record.site_id, record.mpan)
+        date_ordinal = get_energy_date_ordinal(record.date)
+
+        for interval_index, value in enumerate(record.intervals):
+            if math.isfinite(value):
+                continue
+
+            interval_label = (record.interval_labels or HALF_HOURLY_INTERVALS)[
+                interval_index
+            ]
+            historical_values = (
+                [
+                    get_original_interval_value(
+                        original_intervals,
+                        record_key,
+                        date_ordinal - day_offset,
+                        interval_label,
+                    )
+                    for day_offset in (7, 14, 21, 28)
+                ]
+                if date_ordinal is not None
+                else [None, None, None, None]
+            )
+
+            if all(
+                historical_value is not None
+                for historical_value in historical_values
+            ):
+                record.intervals[interval_index] = (
+                    sum(value for value in historical_values if value is not None) / 4
+                )
+                continue
+
+            previous_week_value = historical_values[0]
+
+            if previous_week_value is not None:
+                record.intervals[interval_index] = previous_week_value
+                continue
+
+            unresolved_cells.append(
+                get_cell_reference(
+                    record.record_number,
+                    FIRST_INTERVAL_COLUMN_INDEX + interval_index,
+                )
+            )
+
+    if unresolved_cells:
+        cells = ", ".join(unresolved_cells[:20])
+        remaining_count = len(unresolved_cells) - 20
+        suffix = f" and {remaining_count} more" if remaining_count > 0 else ""
+        raise MatchingModelError(
+            f"The {get_upload_type_label(upload_type)} file has missing readings that cannot be imputed: {cells}{suffix}. Four actual weekly readings were not available and the previous-week reading was also missing."
+        )
+
+
+def get_original_interval_value(
+    original_intervals: dict[tuple[str, int | None, str], float],
+    record_key: str,
+    date_ordinal: int | None,
+    interval_label: str,
+) -> float | None:
+    if date_ordinal is None:
+        return None
+
+    # Repeated long-day periods use the corresponding ordinary settlement
+    # period from earlier weeks as their historical estimate.
+    historical_label = {
+        "01:30 GMT": "01:30",
+        "02:00 GMT": "02:00",
+    }.get(interval_label, interval_label)
+    value = original_intervals.get((record_key, date_ordinal, historical_label))
+    if value is None:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def get_energy_date_ordinal(value: str) -> int | None:
+    for date_format in ("%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, date_format).date().toordinal()
+        except ValueError:
+            continue
+
+    return None
+
+
 def read_spreadsheet_rows(file: UploadedFile) -> list[list[str]]:
+    """Read the first worksheet (or CSV) and discard fully blank rows."""
+
     if file.filename.lower().endswith(".csv"):
         return [
             row
@@ -863,6 +1002,8 @@ def read_csv_rows(content: bytes) -> list[list[str]]:
 
 
 def read_xlsx_rows(content: bytes) -> list[list[str]]:
+    """Read XLSX XML directly to avoid requiring a spreadsheet dependency."""
+
     with zipfile.ZipFile(BytesIO(content)) as workbook:
         shared_strings = read_shared_strings(workbook)
         sheet_path = get_first_sheet_path(workbook)
@@ -943,27 +1084,43 @@ def get_xml_value(cell: ElementTree.Element) -> str:
 
 
 def validate_template_headers(upload_type: str, uploaded_headers: list[str]) -> None:
-    expected_headers = TEMPLATE_HEADERS[upload_type]
+    """Require template columns in their expected order."""
+
+    legacy_headers = TEMPLATE_HEADERS[upload_type]
+    expected_headers = [*legacy_headers[:-1], *CLOCK_CHANGE_HEADERS, legacy_headers[-1]]
+    legacy_reserved_headers = [
+        *legacy_headers[:-1],
+        *LEGACY_RESERVED_HEADERS,
+        legacy_headers[-1],
+    ]
     normalized_uploaded_headers = [normalize_header_value(header) for header in uploaded_headers]
     normalized_expected_headers = [normalize_header_value(header) for header in expected_headers]
+    normalized_legacy_headers = [normalize_header_value(header) for header in legacy_headers]
+    normalized_legacy_reserved_headers = [
+        normalize_header_value(header) for header in legacy_reserved_headers
+    ]
     expected_template = "consumption" if upload_type == "consumption" else "generation"
 
-    if len(normalized_uploaded_headers) < len(normalized_expected_headers):
+    is_legacy_template = normalized_uploaded_headers[: len(normalized_legacy_headers)] == normalized_legacy_headers
+    is_reserved_template = normalized_uploaded_headers[: len(normalized_expected_headers)] == normalized_expected_headers
+    is_legacy_reserved_template = (
+        normalized_uploaded_headers[: len(normalized_legacy_reserved_headers)]
+        == normalized_legacy_reserved_headers
+    )
+
+    if not is_legacy_template and not is_reserved_template and not is_legacy_reserved_template:
         raise MatchingModelError(
             f"This file does not match the {expected_template} template. Please reupload using the correct template."
         )
-
-    for index, expected_header in enumerate(normalized_expected_headers):
-        if normalized_uploaded_headers[index] != expected_header:
-            raise MatchingModelError(
-                f'This file does not match the {expected_template} template. Column {index + 1} should be "{expected_headers[index]}". Please reupload using the correct template.'
-            )
 
 
 def validate_energy_data_rows(
     upload_type: str,
     rows: list[list[str]],
+    calendar: dict[str, str],
 ) -> dict[str, list[str]]:
+    """Collect fatal data errors and non-fatal empty-cell warnings."""
+
     empty_cells: list[str] = []
     errors: list[str] = []
     daily_total_column_index = get_daily_total_column_index(rows[0] if rows else [])
@@ -976,6 +1133,8 @@ def validate_energy_data_rows(
     if daily_total_column_index is not None:
         warning_column_indices.append(daily_total_column_index)
 
+    # A meter may have many dates, but the same meter/date combination must
+    # occur only once.
     record_rows_by_key: dict[tuple[str, str], list[int]] = {}
 
     for row_number, row in enumerate(rows[1:], start=2):
@@ -983,6 +1142,12 @@ def validate_energy_data_rows(
             continue
 
         date = normalize_energy_date_value(cell_at(row, DATE_COLUMN_INDEX))
+        day_type = calendar.get(date)
+        profile_type = get_clock_change_profile_type(
+            row,
+            daily_total_column_index,
+            day_type,
+        )
 
         if not date:
             errors.append(
@@ -998,8 +1163,34 @@ def validate_energy_data_rows(
             record_rows_by_key.setdefault(duplicate_key, []).append(row_number)
 
         for column_index in warning_column_indices:
+            if profile_type == "46-period" and column_index in {
+                FIRST_INTERVAL_COLUMN_INDEX + 2,
+                FIRST_INTERVAL_COLUMN_INDEX + 3,
+            }:
+                continue
             if not cell_at(row, column_index).strip():
                 empty_cells.append(get_cell_reference(row_number, column_index))
+
+        reserve_start = (daily_total_column_index or 53) - 2
+
+        if day_type == "46-period":
+            clock_change_values = (
+                [cell_at(row, reserve_start + index).strip() for index in range(2)]
+                if daily_total_column_index == 53
+                else []
+            )
+            populated_periods = sum(
+                bool(cell_at(row, column_index).strip())
+                for column_index in range(
+                    FIRST_INTERVAL_COLUMN_INDEX,
+                    LAST_INTERVAL_COLUMN_INDEX + 1,
+                )
+            ) + sum(bool(value) for value in clock_change_values)
+            if populated_periods > 48:
+                errors.append(
+                    f"The 46-period calendar date {date} cannot contain 50 readings. "
+                    "Upload either 46 or 48 readings for this date."
+                )
 
         row_has_empty_energy_value = any(
             not cell_at(row, column_index).strip()
@@ -1024,6 +1215,18 @@ def validate_energy_data_rows(
             except MatchingModelError as exc:
                 interval_values_are_valid = False
                 errors.append(str(exc))
+
+        if profile_type == "50-period" and daily_total_column_index is not None:
+            for reserve_index in range(2):
+                try:
+                    interval_total_kwh += parse_energy_value(
+                        cell_at(row, reserve_start + reserve_index),
+                        row_number,
+                        reserve_start + reserve_index + 1,
+                    )
+                except MatchingModelError as exc:
+                    interval_values_are_valid = False
+                    errors.append(str(exc))
 
         if daily_total_column_index is None:
             continue
@@ -1117,6 +1320,8 @@ def build_matching_record_pairs(
     consumption_records: list[ParsedEnergyRecord],
     generation_records: list[ParsedEnergyRecord],
 ) -> list[tuple[ParsedEnergyRecord, ParsedEnergyRecord]]:
+    """Align half-hourly records by date, filling missing sides with 0."""
+
     record_pairs: list[tuple[ParsedEnergyRecord, ParsedEnergyRecord]] = []
     generation_records_by_date = build_generation_records_by_date(generation_records)
     consumption_dates = set()
@@ -1128,23 +1333,27 @@ def build_matching_record_pairs(
         if generation_record is None:
             generation_record = create_zero_energy_record(consumption_record)
 
-        record_pairs.append((consumption_record, generation_record))
+        record_pairs.append(align_energy_record_pair(consumption_record, generation_record))
 
     for generation_record in generation_records_by_date.values():
         if generation_record.date in consumption_dates:
             continue
 
         record_pairs.append(
-            (create_zero_energy_record(generation_record), generation_record)
+            align_energy_record_pair(
+                create_zero_energy_record(generation_record), generation_record
+            )
         )
 
     return record_pairs
 
 
-def build_carry_forward_matching_record_pairs(
+def build_aggregate_matching_record_pairs(
     consumption_records: list[ParsedEnergyRecord],
     generation_records: list[ParsedEnergyRecord],
 ) -> list[tuple[ParsedEnergyRecord, ParsedEnergyRecord]]:
+    """Build date-ordered pairs while preserving individual consumers."""
+
     record_pairs: list[tuple[ParsedEnergyRecord, ParsedEnergyRecord]] = []
     consumption_records_by_date = group_energy_records_by_date(consumption_records)
     generation_records_by_date = build_generation_records_by_date(generation_records)
@@ -1165,13 +1374,13 @@ def build_carry_forward_matching_record_pairs(
 
         if daily_consumption_records:
             for consumption_record in daily_consumption_records:
+                paired_generation = (
+                    generation_record
+                    if generation_record is not None
+                    else create_zero_energy_record(consumption_record)
+                )
                 record_pairs.append(
-                    (
-                        consumption_record,
-                        generation_record
-                        if generation_record is not None
-                        else create_zero_energy_record(consumption_record),
-                    )
+                    align_energy_record_pair(consumption_record, paired_generation)
                 )
             continue
 
@@ -1185,6 +1394,7 @@ def build_carry_forward_matching_record_pairs(
                         consumption_record,
                         date,
                         generation_record.record_number,
+                        generation_record,
                     ),
                     generation_record,
                 )
@@ -1217,6 +1427,8 @@ def get_distinct_consumption_records(
 def build_generation_records_by_date(
     generation_records: list[ParsedEnergyRecord],
 ) -> dict[str, ParsedEnergyRecord]:
+    """Combine all generators into one interval-total record per date."""
+
     grouped_records: dict[str, list[ParsedEnergyRecord]] = {}
 
     for generation_record in generation_records:
@@ -1242,7 +1454,10 @@ def group_energy_records_by_date(
 def aggregate_energy_records(
     records: list[ParsedEnergyRecord],
 ) -> ParsedEnergyRecord:
+    """Sum multiple generator records interval by interval."""
+
     first_record = records[0]
+    interval_labels = get_combined_interval_labels(records)
 
     return ParsedEnergyRecord(
         record_number=first_record.record_number,
@@ -1256,10 +1471,54 @@ def aggregate_energy_records(
         ),
         date=first_record.date,
         intervals=[
-            sum(record.intervals[index] for record in records)
-            for index in range(len(HALF_HOURLY_INTERVALS))
+            sum(get_record_interval_value(record, label) for record in records)
+            for label in interval_labels
         ],
+        interval_labels=interval_labels,
     )
+
+
+def get_combined_interval_labels(records: list[ParsedEnergyRecord]) -> list[str]:
+    """Return the chronological union of settlement periods in the records."""
+
+    available_labels = {
+        label
+        for record in records
+        for label in (record.interval_labels or HALF_HOURLY_INTERVALS)
+    }
+    chronological_labels = (
+        HALF_HOURLY_INTERVALS[:4]
+        + ["01:30 GMT", "02:00 GMT"]
+        + HALF_HOURLY_INTERVALS[4:]
+    )
+    return [label for label in chronological_labels if label in available_labels]
+
+
+def get_record_interval_value(record: ParsedEnergyRecord, label: str) -> float:
+    labels = record.interval_labels or HALF_HOURLY_INTERVALS
+    values_by_label = dict(zip(labels, record.intervals))
+    return values_by_label.get(label, 0.0)
+
+
+def align_energy_record_pair(
+    consumption_record: ParsedEnergyRecord,
+    generation_record: ParsedEnergyRecord,
+) -> tuple[ParsedEnergyRecord, ParsedEnergyRecord]:
+    """Align accepted 46/48/50-period profiles before interval matching."""
+
+    labels = get_combined_interval_labels([consumption_record, generation_record])
+
+    def aligned(record: ParsedEnergyRecord) -> ParsedEnergyRecord:
+        return ParsedEnergyRecord(
+            record_number=record.record_number,
+            site_id=record.site_id,
+            mpan=record.mpan,
+            date=record.date,
+            intervals=[get_record_interval_value(record, label) for label in labels],
+            interval_labels=labels,
+        )
+
+    return aligned(consumption_record), aligned(generation_record)
 
 
 def merge_record_identifier(values: list[str], multiple_value: str) -> str:
@@ -1277,7 +1536,8 @@ def create_zero_energy_record(source_record: ParsedEnergyRecord) -> ParsedEnergy
         site_id=source_record.site_id,
         mpan=source_record.mpan,
         date=source_record.date,
-        intervals=[0.0] * len(HALF_HOURLY_INTERVALS),
+        intervals=[0.0] * len(source_record.intervals),
+        interval_labels=source_record.interval_labels,
     )
 
 
@@ -1285,13 +1545,15 @@ def create_zero_consumption_record_for_date(
     source_record: ParsedEnergyRecord,
     date: str,
     record_number: int,
+    shape_record: ParsedEnergyRecord,
 ) -> ParsedEnergyRecord:
     return ParsedEnergyRecord(
         record_number=record_number,
         site_id=source_record.site_id,
         mpan=source_record.mpan,
         date=date,
-        intervals=[0.0] * len(HALF_HOURLY_INTERVALS),
+        intervals=[0.0] * len(shape_record.intervals),
+        interval_labels=shape_record.interval_labels,
     )
 
 
@@ -1418,6 +1680,37 @@ def normalize_matching_approach(value: str) -> str:
     raise MatchingModelError("Unknown matching approach.")
 
 
+def parse_settlement_calendar(value: str) -> dict[str, str]:
+    try:
+        entries = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(entries, list):
+        return {}
+
+    calendar: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("status") != "Active":
+            continue
+        day_type = entry.get("dayType")
+        date = normalize_calendar_date(str(entry.get("date", "")))
+        if date and day_type in {"46-period", "50-period"}:
+            calendar[date] = day_type
+    return calendar
+
+
+def normalize_calendar_date(value: str) -> str:
+    normalized = normalize_energy_date_value(value)
+    for date_format in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(normalized, date_format)
+            return f"{parsed.day:02d}/{parsed.month:02d}/{parsed.year}"
+        except ValueError:
+            continue
+    return normalized
+
+
 def get_column_index(cell_reference: str) -> int:
     match = re.match(r"([A-Z]+)", cell_reference)
 
@@ -1432,6 +1725,8 @@ def get_column_index(cell_reference: str) -> int:
 
 
 def parse_customer_allocations(raw_value: str) -> list[dict[str, Any]]:
+    """Decode customer allocation JSON supplied with the API request."""
+
     if not raw_value:
         return []
 
@@ -1458,6 +1753,8 @@ def parse_generator_commodity_mappings(raw_value: str) -> list[dict[str, Any]]:
 def build_customer_allocation_map(
     customer_allocations: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
+    """Index validated allocations by normalized Site ID and MPAN."""
+
     customer_allocation_map = {}
 
     for customer_allocation in customer_allocations:
@@ -1508,7 +1805,9 @@ def build_commodity_generation_totals(
             generator_commodity_map,
         )
 
-        for interval_index, interval in enumerate(HALF_HOURLY_INTERVALS):
+        for interval_index, interval in enumerate(
+            generation_record.interval_labels or HALF_HOURLY_INTERVALS
+        ):
             generation_kwh = generation_record.intervals[interval_index]
 
             if generation_kwh == 0:
@@ -1537,14 +1836,15 @@ def add_commodity_matched_energy(
         return
 
     total_generation_kwh = sum(
-        record.intervals[interval_index] for record in source_generation_records
+        get_record_interval_value(record, interval)
+        for record in source_generation_records
     )
 
     if total_generation_kwh <= 0:
         return
 
     for generation_record in source_generation_records:
-        source_generation_kwh = generation_record.intervals[interval_index]
+        source_generation_kwh = get_record_interval_value(generation_record, interval)
 
         if source_generation_kwh == 0:
             continue
@@ -1595,6 +1895,48 @@ def build_commodity_energy_results(
         )
 
     return commodity_energy_results
+
+
+def aggregate_commodity_energy_results(
+    commodity_results: list[dict[str, Any]],
+    matching_approach: str,
+) -> list[dict[str, Any]]:
+    """Express commodity results at the selected matching granularity."""
+
+    if matching_approach == "non-carry-forward":
+        return commodity_results
+
+    intervals_per_window = 0 if matching_approach == "carry-forward" else 2
+    long_day_labels = (
+        HALF_HOURLY_INTERVALS[:4]
+        + ["01:30 GMT", "02:00 GMT"]
+        + HALF_HOURLY_INTERVALS[4:]
+    )
+    interval_indices = {interval: index for index, interval in enumerate(long_day_labels)}
+    aggregated: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    for result in commodity_results:
+        interval_index = interval_indices.get(result["interval"], 0)
+        if intervals_per_window == 0:
+            interval = "Daily"
+        else:
+            window_end = ((interval_index // intervals_per_window) + 1) * intervals_per_window
+            interval = long_day_labels[min(window_end, len(long_day_labels)) - 1]
+        key = (result["commodity"], result["date"], interval)
+        current = aggregated.setdefault(
+            key,
+            {
+                "commodity": result["commodity"],
+                "date": result["date"],
+                "interval": interval,
+                "generationKwh": 0.0,
+                "matchedEnergyKwh": 0.0,
+            },
+        )
+        current["generationKwh"] += result["generationKwh"]
+        current["matchedEnergyKwh"] += result["matchedEnergyKwh"]
+
+    return list(aggregated.values())
 
 
 def get_or_create_commodity_energy_total(

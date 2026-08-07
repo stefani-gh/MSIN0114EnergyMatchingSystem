@@ -6,6 +6,7 @@ import type {
   MatchingCustomerAllocation,
   MatchingEngineResult,
 } from './matchingTypes'
+import { readSettlementCalendar } from './calendarSettings'
 
 export type { EnergyUploadType } from './matchingTypes'
 
@@ -32,6 +33,7 @@ export async function validateEnergyFileTemplate(
   const formData = new FormData()
   formData.append('file', file)
   formData.append('uploadType', uploadType)
+  formData.append('settlementCalendar', JSON.stringify(readSettlementCalendar()))
 
   try {
     const response = await fetch('/api/matching/validate', {
@@ -86,6 +88,7 @@ export async function runMatchingEngine(
     'matchingApproach',
     options.matchingApproach ?? 'non-carry-forward',
   )
+  formData.append('settlementCalendar', JSON.stringify(readSettlementCalendar()))
 
   const response = await fetch('/api/matching/run', {
     method: 'POST',
