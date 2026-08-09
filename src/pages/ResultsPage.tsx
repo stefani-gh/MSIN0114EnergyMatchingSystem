@@ -39,6 +39,7 @@ import {
   normalizeEnergyDateValue,
   type CommodityEnergyResult,
   type HalfHourlyMatchingResult,
+  type MatchingApproach,
   type MatchingCustomerAllocation,
   type MatchingEngineResult,
   type MatchingSummary,
@@ -475,6 +476,7 @@ function MatchingResultVisualisations({
               summary={resultGroup.summary}
               summaryTitle={`Summary Dashboard`}
               generationLabel="Allocated generation"
+              matchingApproach={result.matchingApproach}
             />
           </div>
         ))
@@ -484,6 +486,7 @@ function MatchingResultVisualisations({
           summary={visualisationSummary}
           summaryTitle="Summary Dashboard"
           generationLabel="Generation"
+          matchingApproach={result.matchingApproach}
           commodityEnergyResults={commodityEnergyResults}
         />
       )}
@@ -500,12 +503,14 @@ function MatchingVisualisationSet({
   summary,
   summaryTitle,
   generationLabel,
+  matchingApproach,
   commodityEnergyResults = [],
 }: {
   results: HalfHourlyMatchingResult[]
   summary: MatchingSummary
   summaryTitle: string
   generationLabel: string
+  matchingApproach?: MatchingApproach
   commodityEnergyResults?: CommodityEnergyResult[]
 }) {
   const hasCommodityEnergyResults = commodityEnergyResults.length > 0
@@ -539,15 +544,24 @@ function MatchingVisualisationSet({
       </div>
 
       <div data-pdf-section>
-        <SectionCard
-          title="Average Matching-Period Profile"
-          description="Average consumption and allocated generation at the selected matching granularity."
-        >
-          <AverageDailyProfileChart
-            results={results}
-            generationLabel={`Average ${generationLabel.toLowerCase()}`}
-          />
-        </SectionCard>
+        {matchingApproach === 'carry-forward' ? (
+          <SectionCard
+            title="Daily Matching Balance"
+            description="Daily matched energy, unmatched consumption, and excess allocated generation calculated directly at daily granularity."
+          >
+            <DailyMatchingBalanceChart results={results} />
+          </SectionCard>
+        ) : (
+          <SectionCard
+            title="Average Matching-Period Profile"
+            description="Average consumption and allocated generation at the selected matching granularity."
+          >
+            <AverageDailyProfileChart
+              results={results}
+              generationLabel={`Average ${generationLabel.toLowerCase()}`}
+            />
+          </SectionCard>
+        )}
       </div>
 
       {hasCommodityEnergyResults && (
@@ -592,10 +606,21 @@ function MatchingVisualisationSet({
 
       <div data-pdf-section>
         <SectionCard
-          title="Matching Score by Matching Period"
-          description="Weighted matching score across each period in the selected approach."
+          title={
+            matchingApproach === 'carry-forward'
+              ? 'Daily Matching Score'
+              : 'Matching Score by Matching Period'
+          }
+          description={
+            matchingApproach === 'carry-forward'
+              ? 'Consumption-weighted matching score for each date at daily aggregation granularity.'
+              : 'Weighted matching score across each period in the selected approach.'
+          }
         >
-          <MatchingScoreLineChart results={results} />
+          <MatchingScoreLineChart
+            results={results}
+            matchingApproach={matchingApproach}
+          />
         </SectionCard>
       </div>
 
@@ -641,6 +666,13 @@ type DailyEnergyPoint = {
   label: string
   consumptionKwh: number
   generationKwh: number
+}
+
+type DailyMatchingBalancePoint = {
+  label: string
+  matchedEnergyKwh: number
+  unmatchedConsumptionKwh: number
+  excessGenerationKwh: number
 }
 
 type DailyEnergyCommodityPoint = DailyEnergyPoint & CommodityChartPoint
@@ -1317,6 +1349,76 @@ function MonthlyMatchingPerformance({
   )
 }
 
+function DailyMatchingBalanceChart({
+  results,
+}: {
+  results: HalfHourlyMatchingResult[]
+}) {
+  const dailyData = getDailyMatchingBalanceData(results)
+
+  if (!dailyData.length) {
+    return <ChartEmptyState />
+  }
+
+  return (
+    <ResponsiveContainer width="100%" height={320}>
+      <LineChart
+        data={dailyData}
+        margin={{ top: 12, right: 24, bottom: 8, left: 8 }}
+      >
+        <CartesianGrid stroke="#E2E8F0" strokeDasharray="4 4" />
+        <XAxis
+          dataKey="label"
+          tickLine={false}
+          axisLine={{ stroke: '#CBD5E1' }}
+          minTickGap={24}
+        />
+        <YAxis
+          domain={[0, 'auto']}
+          tickLine={false}
+          axisLine={{ stroke: '#CBD5E1' }}
+          tickFormatter={(value) => formatNumber(Number(value))}
+        />
+        <Tooltip
+          formatter={(value, name) => [
+            `${formatNumber(Number(value))} kWh`,
+            getBreakdownLabel(String(name)),
+          ]}
+          labelFormatter={(label) => `Date: ${String(label)}`}
+        />
+        <Legend />
+        <Line
+          type="linear"
+          dataKey="matchedEnergyKwh"
+          name="Matched energy"
+          stroke={chartColors.matched}
+          strokeWidth={2.5}
+          dot={false}
+          activeDot={{ r: 5 }}
+        />
+        <Line
+          type="linear"
+          dataKey="unmatchedConsumptionKwh"
+          name="Unmatched consumption"
+          stroke={chartColors.unmatched}
+          strokeWidth={2.25}
+          dot={false}
+          activeDot={{ r: 5 }}
+        />
+        <Line
+          type="linear"
+          dataKey="excessGenerationKwh"
+          name="Excess allocated generation"
+          stroke={chartColors.excess}
+          strokeWidth={2.25}
+          dot={false}
+          activeDot={{ r: 5 }}
+        />
+      </LineChart>
+    </ResponsiveContainer>
+  )
+}
+
 function AverageDailyProfileChart({
   results,
   generationLabel,
@@ -1528,11 +1630,17 @@ function MatchingScoreComparisonChart({
 
 function MatchingScoreLineChart({
   results,
+  matchingApproach,
 }: {
   results: HalfHourlyMatchingResult[]
+  matchingApproach?: MatchingApproach
 }) {
   const gradientId = useId().replaceAll(':', '')
-  const settlementData = getSettlementPeriodMatchingScoreData(results)
+  const settlementData =
+    matchingApproach === 'carry-forward'
+      ? getDailyMatchingScoreData(results)
+      : getSettlementPeriodMatchingScoreData(results)
+  const isDailyAggregation = matchingApproach === 'carry-forward'
 
   if (!settlementData.length) {
     return <ChartEmptyState />
@@ -1553,7 +1661,8 @@ function MatchingScoreLineChart({
         <CartesianGrid stroke="#E2E8F0" strokeDasharray="4 4" />
         <XAxis
           dataKey="interval"
-          interval={5}
+          interval={isDailyAggregation ? 'preserveStartEnd' : 5}
+          minTickGap={isDailyAggregation ? 24 : undefined}
           tickLine={false}
           axisLine={{ stroke: '#CBD5E1' }}
           tickMargin={12}
@@ -1569,7 +1678,9 @@ function MatchingScoreLineChart({
             `${formatPercentage(Number(value))}%`,
             'Matching score',
           ]}
-          labelFormatter={(label) => `Matching period: ${String(label)}`}
+          labelFormatter={(label) =>
+            `${isDailyAggregation ? 'Date' : 'Matching period'}: ${String(label)}`
+          }
         />
         <Area
           type="linear"
@@ -2027,6 +2138,28 @@ function getAverageDailyProfileData(results: HalfHourlyMatchingResult[]) {
     .sort((firstPoint, secondPoint) => firstPoint.intervalOrder - secondPoint.intervalOrder)
 }
 
+function getDailyMatchingBalanceData(
+  results: HalfHourlyMatchingResult[],
+): DailyMatchingBalancePoint[] {
+  const dailyTotals = new Map<number, DailyMatchingBalancePoint>()
+
+  results.forEach((row) => {
+    const currentPoint = dailyTotals.get(row.recordNumber) ?? {
+      label: normalizeEnergyDateValue(row.date) || `Record ${row.recordNumber}`,
+      matchedEnergyKwh: 0,
+      unmatchedConsumptionKwh: 0,
+      excessGenerationKwh: 0,
+    }
+
+    currentPoint.matchedEnergyKwh += row.matchedEnergyKwh
+    currentPoint.unmatchedConsumptionKwh += row.unmatchedConsumptionKwh
+    currentPoint.excessGenerationKwh += row.excessGenerationKwh
+    dailyTotals.set(row.recordNumber, currentPoint)
+  })
+
+  return Array.from(dailyTotals.values())
+}
+
 function getMatchingScoreGranularityData(results: HalfHourlyMatchingResult[]) {
   const totalConsumptionKwh = results.reduce(
     (total, row) => total + row.consumptionKwh,
@@ -2118,6 +2251,34 @@ function getSettlementPeriodMatchingScoreData(
       ),
     }))
     .sort((firstPoint, secondPoint) => firstPoint.intervalOrder - secondPoint.intervalOrder)
+}
+
+function getDailyMatchingScoreData(
+  results: HalfHourlyMatchingResult[],
+): MatchingScoreSettlementPoint[] {
+  const dailyTotals = new Map<number, MatchingScoreSettlementPoint>()
+
+  results.forEach((row) => {
+    const currentPoint = dailyTotals.get(row.recordNumber) ?? {
+      interval: normalizeEnergyDateValue(row.date) || `Record ${row.recordNumber}`,
+      intervalOrder: dailyTotals.size,
+      totalConsumptionKwh: 0,
+      totalGenerationKwh: 0,
+      totalMatchedEnergyKwh: 0,
+      matchingScore: 0,
+    }
+
+    addMatchingScoreTotals(currentPoint, row)
+    dailyTotals.set(row.recordNumber, currentPoint)
+  })
+
+  return Array.from(dailyTotals.values()).map((point) => ({
+    ...point,
+    matchingScore: calculateMatchingScore(
+      point.totalMatchedEnergyKwh,
+      point.totalConsumptionKwh,
+    ),
+  }))
 }
 
 function getMatchingScoreHeatmapData(results: HalfHourlyMatchingResult[]) {
@@ -2504,6 +2665,9 @@ function getChartSeriesLabel(name: string) {
 
 function getBreakdownLabel(dataKey: string) {
   const labels: Record<string, string> = {
+    matchedEnergyKwh: 'Matched energy',
+    unmatchedConsumptionKwh: 'Unmatched consumption',
+    excessGenerationKwh: 'Excess allocated generation',
     totalMatchedEnergyKwh: 'Matched energy',
     totalUnmatchedConsumptionKwh: 'Unmatched consumption',
     totalExcessGenerationKwh: 'Excess generation',

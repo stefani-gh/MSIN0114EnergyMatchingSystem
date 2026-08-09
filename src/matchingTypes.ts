@@ -7,16 +7,16 @@ export type MatchingApproach =
 
 export const matchingApproachOptions = [
   {
-    value: 'carry-forward',
-    label: 'Aggregate (Daily)',
+    value: 'non-carry-forward',
+    label: 'Half-hourly matching',
   },
   {
     value: 'carry-forward-hourly',
-    label: 'Aggregate (Hourly)',
+    label: 'Hourly aggregation matching',
   },
   {
-    value: 'non-carry-forward',
-    label: 'Half-hourly matching',
+    value: 'carry-forward',
+    label: 'Daily aggregation matching',
   },
 ] as const satisfies ReadonlyArray<{
   value: MatchingApproach
