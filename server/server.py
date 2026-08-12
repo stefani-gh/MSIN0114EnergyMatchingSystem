@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import sqlite3
 import traceback
 import uuid
@@ -24,7 +27,9 @@ from matching_model import (
 
 
 SERVER_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SERVER_DIR.parent
 DB_PATH = SERVER_DIR / "data" / "template-store.sqlite"
+LOGIN_FILE_PATH = PROJECT_DIR / "login.txt"
 PORT = int(os.environ.get("PORT", "5174"))
 SERVER_INSTANCE_ID = uuid.uuid4().hex
 TEMPLATE_ROUTES = {
@@ -129,6 +134,10 @@ class EnergyMatchingRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         try:
+            if path == "/api/auth/login":
+                self.handle_login()
+                return
+
             if path == "/api/settings/calendar":
                 self.handle_save_calendar()
                 return
@@ -152,6 +161,20 @@ class EnergyMatchingRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"error": "The matching engine could not process these files."},
             )
+
+    def handle_login(self) -> None:
+        payload = read_json_request(self)
+        username = str(payload.get("username", "")).strip()
+        password = str(payload.get("password", ""))
+
+        authenticated_user = authenticate_login(username, password)
+        if authenticated_user is None:
+            raise ApiError(
+                HTTPStatus.UNAUTHORIZED,
+                "Invalid username or password.",
+            )
+
+        self.send_json(HTTPStatus.OK, {"user": authenticated_user})
 
     def handle_get_calendar(self) -> None:
         with sqlite3.connect(DB_PATH) as connection:
@@ -380,6 +403,85 @@ def read_json_request(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid JSON request.")
     return payload
+
+
+def authenticate_login(username: str, password: str) -> dict[str, str] | None:
+    if not username or not password or not LOGIN_FILE_PATH.exists():
+        return None
+
+    login_lines = LOGIN_FILE_PATH.read_text(encoding="utf-8").splitlines()
+    matching_line_index: int | None = None
+    matching_fields: list[str] | None = None
+
+    for line_index, line in enumerate(login_lines):
+        stripped_line = line.strip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) != 4:
+            continue
+
+        if hmac.compare_digest(fields[0].casefold(), username.casefold()):
+            matching_line_index = line_index
+            matching_fields = fields
+            break
+
+    if matching_fields is None or matching_line_index is None:
+        return None
+
+    stored_username, stored_password, role, status = matching_fields
+    normalized_role = role.casefold()
+    if normalized_role not in {"admin", "standard"} or status.casefold() != "active":
+        return None
+
+    password_matches, needs_upgrade = verify_login_password(password, stored_password)
+    if not password_matches:
+        return None
+
+    if needs_upgrade:
+        login_lines[matching_line_index] = "|".join(
+            [stored_username, create_password_hash(password), normalized_role, status]
+        )
+        LOGIN_FILE_PATH.write_text("\n".join(login_lines) + "\n", encoding="utf-8")
+
+    return {
+        "username": stored_username,
+        "displayName": stored_username,
+        "email": "",
+        "role": normalized_role,
+    }
+
+
+def verify_login_password(password: str, stored_password: str) -> tuple[bool, bool]:
+    if not stored_password.startswith("pbkdf2_sha256$"):
+        return hmac.compare_digest(password, stored_password), True
+
+    try:
+        _, iterations_value, salt, expected_hash = stored_password.split("$", 3)
+        iterations = int(iterations_value)
+        actual_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            iterations,
+        ).hex()
+    except (TypeError, ValueError):
+        return False, False
+
+    return hmac.compare_digest(actual_hash, expected_hash), False
+
+
+def create_password_hash(password: str) -> str:
+    iterations = 600_000
+    salt = secrets.token_hex(16)
+    derived_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        iterations,
+    ).hex()
+    return f"pbkdf2_sha256${iterations}${salt}${derived_hash}"
 
 
 def ensure_calendar_table(connection: sqlite3.Connection) -> None:

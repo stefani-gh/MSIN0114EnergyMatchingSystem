@@ -1,51 +1,52 @@
 import {
   BarChart3,
   Clock3,
-  LockKeyhole,
   LogIn,
-  UserRound,
 } from 'lucide-react'
 import { useState, type FormEvent } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { CompanyLogo } from '../components/Layout'
-import { Button, TextInput } from '../components/ui'
-import { demoUsers, useMockSession, type UserRole } from '../session'
-
-const demoPassword = 'demo-password'
+import { Button, PlaceholderNotice, TextInput } from '../components/ui'
+import { useMockSession, type DemoUser } from '../session'
 
 export function LoginPage() {
-  const [role, setRole] = useState<UserRole>('standard')
-  const [username, setUsername] = useState(demoUsers.standard.username)
-  const [password, setPassword] = useState(demoPassword)
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [isSubmitting, setIsSubmitting] = useState(false)
   const { login } = useMockSession()
   const navigate = useNavigate()
-  const roleOptions: Array<{
-    value: UserRole
-    label: string
-    icon: typeof UserRound
-  }> = [
-    {
-      value: 'standard',
-      label: 'Standard user',
-      icon: UserRound,
-    },
-    {
-      value: 'admin',
-      label: 'Admin user',
-      icon: LockKeyhole,
-    },
-  ]
-
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    login(role)
-    navigate('/dashboard')
-  }
+    setError('')
+    setIsSubmitting(true)
 
-  function selectRole(nextRole: UserRole) {
-    setRole(nextRole)
-    setUsername(demoUsers[nextRole].username)
-    setPassword(demoPassword)
+    try {
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      })
+      const payload = (await response.json().catch(() => ({}))) as {
+        error?: string
+        user?: DemoUser
+      }
+
+      if (!response.ok || !payload.user) {
+        throw new Error(payload.error || 'Login could not be completed.')
+      }
+
+      login(payload.user)
+      navigate('/dashboard')
+    } catch (loginError) {
+      setError(
+        loginError instanceof Error
+          ? loginError.message
+          : 'Login could not be completed.',
+      )
+    } finally {
+      setIsSubmitting(false)
+    }
   }
 
   return (
@@ -118,6 +119,7 @@ export function LoginPage() {
                 autoComplete="username"
                 className="h-12"
                 onChange={(event) => setUsername(event.target.value)}
+                required
               />
               <TextInput
                 label="Password"
@@ -126,34 +128,18 @@ export function LoginPage() {
                 autoComplete="current-password"
                 className="h-12"
                 onChange={(event) => setPassword(event.target.value)}
+                required
               />
 
-              <div>
-                <p className="text-sm font-medium text-slate-700">
-                  Simulate login as
-                </p>
-                <div className="mt-2 grid grid-cols-2 gap-2 rounded-lg border border-slate-200 bg-slate-50 p-1.5">
-                  {roleOptions.map((item) => (
-                    <button
-                      key={item.value}
-                      type="button"
-                      onClick={() => selectRole(item.value)}
-                      className={[
-                        'flex min-h-11 items-center justify-center gap-2 rounded-md px-3 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-[#3A61F4]/25',
-                        role === item.value
-                          ? 'bg-white text-[#3A61F4] shadow-sm'
-                          : 'text-slate-600 hover:text-slate-950',
-                      ].join(' ')}
-                    >
-                      <item.icon className="size-4 shrink-0" aria-hidden="true" />
-                      <span>{item.label}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
+              {error && <PlaceholderNotice>{error}</PlaceholderNotice>}
 
-              <Button className="h-12 w-full" type="submit" icon={LogIn}>
-                Login
+              <Button
+                className="h-12 w-full"
+                type="submit"
+                icon={LogIn}
+                disabled={isSubmitting}
+              >
+                {isSubmitting ? 'Signing in...' : 'Login'}
               </Button>
             </form>
 

@@ -17,7 +17,7 @@ export type MockSession = {
 
 export type MockSessionContextValue = {
   session: MockSession
-  login: (role: UserRole) => void
+  login: (user: DemoUser) => void
   logout: () => void
   updateUser: (user: Partial<DemoUser>) => void
 }

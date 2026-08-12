@@ -16,6 +16,8 @@ __pycache__/
 *.py[cod]
 server/data/*.sqlite
 server/data/*.sqlite-*
+server/data/users.txt
+login.txt
 
 # Editor directories and files
 .vscode/*

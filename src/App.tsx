@@ -86,11 +86,11 @@ function sanitizeStoredUser(user: unknown, role: UserRole): Partial<DemoUser> {
 function App() {
   const [session, setSession] = useState<MockSession>(readStoredSession)
 
-  function login(role: UserRole) {
+  function login(user: DemoUser) {
     const nextSession: MockSession = {
       isLoggedIn: true,
-      role,
-      user: demoUsers[role],
+      role: user.role,
+      user,
     }
 
     window.localStorage.setItem(sessionKey, JSON.stringify(nextSession))
